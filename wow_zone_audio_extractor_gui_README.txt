@@ -52,6 +52,13 @@ What it does:
   - <target>\zones\<Family Name>\<Zone Name>\zone_manifest.json
   - manifest.csv files for each group and zone
 - When two sound kits share a group name, each folder gets a " (kit N)" suffix
+- Weather: with the Weather box ticked, each zone also lists weather presets
+  (rain, snow, sandstorm, thunderstorm and more) under the Weather role.
+  They start unchecked; check the ones you want to export. WoW's data does
+  not say which weather a zone gets, because the server picks it.
+- zone_manifest.json gives each group its playback (role, time of day,
+  weather) and import_defaults with pitch range, pan spread, first delay and
+  music silence. KrakenScape uses these to build Day, Night and weather moods.
 - Extracting again adds to the manifests and export index. Clips exported
   before are kept, and a clip exported again replaces its older file.
 

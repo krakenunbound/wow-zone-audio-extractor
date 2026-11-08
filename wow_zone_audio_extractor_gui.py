@@ -32,7 +32,7 @@ from agent_bridge import AgentBridge, AGENT_PORT
 
 
 APP_TITLE = "WoW Zone Audio Extractor"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.5.0"
 WAGO_DB_INDEX_URL = "https://wago.tools/db2"
 WAGO_DB_TABLE_URL = "https://wago.tools/db2/{table}/csv?build={build}&locale=enUS"
 WAGO_CASC_URL = "https://wago.tools/api/casc/{file_data_id}"
@@ -593,6 +593,42 @@ class ZoneInfo:
         return "Standalone Zones"
 
 
+WEATHER_LOOP = "Weather"
+WEATHER_DETAIL = "WeatherDetail"
+
+# Weather is not tied to zones in the client data; the server picks it while you
+# play. So each zone lists these presets and you choose which to export. Labels
+# come from the client file name of each weather's main loop, matched in order.
+WEATHER_PRESETS: tuple[tuple[str, str], ...] = (
+    ("Rain (light)", r"rain_?light"),
+    ("Rain (medium)", r"rain_?med"),
+    ("Rain (heavy)", r"rain_?heavy"),
+    ("Snow (light)", r"snow_?light"),
+    ("Snow (medium)", r"snow_?medium"),
+    ("Snow (heavy)", r"snow_?heavy"),
+    ("Sandstorm (light)", r"sandstorm_?light"),
+    ("Sandstorm (medium)", r"sandstorm_?medium"),
+    ("Sandstorm (heavy)", r"sandstorm_?heavy"),
+    ("Windstorm", r"heavy_wind|med_wind"),
+    ("Lightning Storm", r"lightningstorm"),
+    ("Blazing Sky", r"blazing_sky"),
+    ("Void Storm", r"void_storm"),
+)
+THUNDERSTORM_LABEL = "Thunderstorm"
+# One-shots a weather row starts with must look like weather, or they are left out.
+WEATHER_DETAIL_PATTERN = r"weather|wind|gust|lightning|thunder|sand|fire_explosion|void"
+DEFAULT_THUNDER_INTERVAL_MS = (8000, 40000)
+
+
+@dataclasses.dataclass
+class WeatherPreset:
+    label: str
+    weather_id: int
+    loop_kit: int
+    detail_kits: list[int]
+    detail_interval_ms: tuple[int, int] | None = None
+
+
 ZONE_CATALOG_NAME = "zones.json"
 AUDIO_INDEX_NAME = "audio_index.pkl"
 
@@ -637,7 +673,7 @@ def read_zone_catalog(path: Path, build: str) -> list[ZoneInfo] | None:
 class AudioEntry:
     zone_id: int
     zone_name: str
-    category: str  # "music" or "ambient sounds"
+    category: str  # "music", "ambient sounds" or "weather"
     sound_kit_id: int
     file_data_id: int
     source_type: str
@@ -646,12 +682,21 @@ class AudioEntry:
 
     @property
     def category_slug(self) -> str:
-        return "music" if self.category == "music" else "ambient"
+        if self.category in ("music", "weather"):
+            return self.category
+        return "ambient"
+
+    @property
+    def is_weather(self) -> bool:
+        return self.category == "weather"
 
     @property
     def group_label(self) -> str:
         hint = (self.hint or "").strip()
         hint_lower = hint.lower()
+        if self.is_weather:
+            # hint is the weather name, such as "Rain (heavy)".
+            return f"{hint} Details" if self.source_type == WEATHER_DETAIL else (hint or "Weather")
         if self.category == "music":
             if self.source_type == "ZoneIntroMusicTable":
                 return f"Intro Theme: {hint}" if hint else "Intro Theme"
@@ -705,7 +750,7 @@ class AudioEntry:
     def suggested_layer_type(self) -> str:
         if self.category == "music":
             return "playlist"
-        if self.source_type == "SoundAmbienceFlavor":
+        if self.source_type in ("SoundAmbienceFlavor", WEATHER_DETAIL):
             return "intermittent"
         return "loop"
 
@@ -719,11 +764,14 @@ class AudioEntry:
             return f"Flavor #{self.source_id}"
         if self.source_type == "SoundAmbience":
             return f"Ambience #{self.source_id}"
+        if self.is_weather:
+            return f"Weather #{self.source_id}"
         return f"{self.source_type} #{self.source_id}"
 
     @property
     def time_of_day(self) -> str:
-        hint_lower = (self.hint or "").lower()
+        if self.is_weather:
+            return "Any"
         if mentions_time(self.hint, "night"):
             return "Night"
         if mentions_time(self.hint, "day"):
@@ -732,6 +780,8 @@ class AudioEntry:
 
     @property
     def type_label(self) -> str:
+        if self.is_weather:
+            return "Weather"
         if self.category == "music":
             if self.source_type == "ZoneIntroMusicTable":
                 return "Intro Theme"
@@ -743,6 +793,8 @@ class AudioEntry:
     @property
     def mood_label(self) -> str:
         hint_lower = (self.hint or "").lower()
+        if self.is_weather:
+            return "Weather"
         if self.source_type == "ZoneIntroMusicTable":
             return "Cinematic"
         if self.category == "music":
@@ -835,12 +887,15 @@ def describe_playback(
     entry: AudioEntry,
     profile: dict[str, object] | None,
     music_silence_ms: tuple[int, int] | None = None,
+    weather_interval_ms: tuple[int, int] | None = None,
 ) -> dict[str, object]:
-    """Say which clock a clip is on: bed, atmosphere, detail, or music."""
+    """Say which clock a clip is on: bed, atmosphere, detail, music, or weather."""
     profile = profile or {}
     hint = (entry.hint or "").lower()
     looping = bool(profile.get("looping"))
-    if entry.category == "music":
+    if entry.is_weather:
+        role = "Weather"
+    elif entry.category == "music":
         role = "Intro" if entry.source_type == "ZoneIntroMusicTable" else "Music"
     elif "ambient loop" in hint:
         role = "Bed"
@@ -861,7 +916,15 @@ def describe_playback(
     pos_max = int(profile.get("pos_max") or 0)
     volume = profile.get("volume")
 
-    if role == "Bed":
+    if entry.source_type == WEATHER_DETAIL and weather_interval_ms:
+        interval_min, interval_max = weather_interval_ms
+
+    if role == "Weather":
+        if entry.source_type == WEATHER_DETAIL:
+            how = f"One-shot during {entry.hint}. Plays, then waits {_seconds_window(interval_min, interval_max)}."
+        else:
+            how = f"{entry.hint} loop. Runs on top of the zone for as long as this weather lasts."
+    elif role == "Bed":
         how = "Always-on seamless loop. Birds and animal calls inside this recording share its clock."
     elif role == "Atmosphere":
         window = _seconds_window(interval_min, interval_max)
@@ -907,6 +970,11 @@ def describe_playback(
         "fade_out_ms": fade_out,
         "pos_min": pos_min,
         "pos_max": pos_max,
+        "silence_min_ms": int(music_silence_ms[0]) if music_silence_ms else 0,
+        "silence_max_ms": int(music_silence_ms[1]) if music_silence_ms else 0,
+        "weather": entry.hint if entry.is_weather else "",
+        "weather_part": ("detail" if entry.source_type == WEATHER_DETAIL else "loop") if entry.is_weather else "",
+        "transition": "ambient start" in hint or "ambient stop" in hint,
         "sound_kit_id": entry.sound_kit_id,
         "time_of_day": entry.time_of_day,
         "hint": entry.hint,
@@ -927,23 +995,44 @@ def import_defaults_for_entry(
     entry: AudioEntry,
     playback: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    """Layer settings for KrakenScape. Seconds, 0-1 volumes, and semitones for pitch."""
     playback = playback or {}
     role = str(playback.get("role") or "")
     volume = playback.get("volume")
+    pitch = {
+        "pitch_down": float(playback.get("pitch_down") or 0),
+        "pitch_up": float(playback.get("pitch_up") or 0),
+    }
+
+    def seconds(key: str) -> float:
+        return int(playback.get(key) or 0) / 1000
+
     if entry.category == "music" or role in {"Music", "Intro"}:
+        gap_min, gap_max = seconds("silence_min_ms"), seconds("silence_max_ms")
         return {
             "type": "playlist" if role != "Intro" else "loop",
             "volume": volume if isinstance(volume, (int, float)) and volume else 0.58,
             "shuffle": role != "Intro",
             "repeat": role != "Intro",
             "crossfade_duration": 4.0,
+            # The client stays silent between music tracks. 0 means play back to back.
+            "track_gap_min": gap_min,
+            "track_gap_max": max(gap_min, gap_max),
         }
 
     if role == "Detail" or entry.suggested_layer_type == "intermittent":
-        min_delay = (int(playback.get("interval_min_ms") or 0) / 1000) or 8
-        max_delay = (int(playback.get("interval_max_ms") or 0) / 1000) or 24
-        fade_in = (int(playback.get("fade_in_ms") or 0) / 1000) or 0.15
-        fade_out = (int(playback.get("fade_out_ms") or 0) / 1000) or 0.65
+        min_delay = seconds("interval_min_ms") or 8
+        max_delay = seconds("interval_max_ms") or 24
+        fade_in = seconds("fade_in_ms") or 0.15
+        fade_out = seconds("fade_out_ms") or 0.65
+        pos_max = int(playback.get("pos_max") or 0)
+        if entry.source_type == WEATHER_DETAIL:
+            pan_spread = 0.7  # Thunder and gusts come from all around.
+        elif pos_max:
+            pan_spread = max(0.3, min(0.9, pos_max / 30))  # Farther placement pans wider.
+        else:
+            pan_spread = 0.35
+        first_min, first_max = seconds("delay_min_ms"), seconds("delay_max_ms")
         return {
             "type": "intermittent",
             "volume": volume if isinstance(volume, (int, float)) and volume else 0.48,
@@ -955,6 +1044,10 @@ def import_defaults_for_entry(
             "max_volume": 1.0,
             "fade_in": fade_in,
             "fade_out": fade_out,
+            "pan_spread": pan_spread,
+            "first_delay_min": first_min,
+            "first_delay_max": max(first_min, first_max),
+            **pitch,
         }
 
     return {
@@ -1085,6 +1178,21 @@ class ListfileCache:
                 os.utime(self.listfile_path)  # Do not retry on every lookup.
             return self.listfile_path
 
+    def find_paths(self, pattern: str) -> dict[int, str]:
+        """Every listfile entry whose path matches pattern (case-insensitive). Scans the whole file."""
+        regex = re.compile(pattern, re.IGNORECASE)
+        found: dict[int, str] = {}
+        path = self.ensure_listfile()
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+            for line in handle:
+                raw_id, _sep, raw_name = line.strip().partition(";")
+                if raw_name and regex.search(raw_name):
+                    try:
+                        found[int(raw_id)] = raw_name
+                    except ValueError:
+                        continue
+        return found
+
     def lookup_file_name(self, file_data_id: int) -> str | None:
         if file_data_id <= 0:
             return None
@@ -1153,6 +1261,8 @@ class ZoneAudioResolver:
         self._soundkit_to_files: dict[int, list[int]] | None = None
         self._kit_profiles: dict[int, dict[str, object]] | None = None
         self._kit_profiles_failed_at = -1e9
+        self._weather_presets: list[WeatherPreset] | None = None
+        self._weather_intervals: dict[int, tuple[int, int]] = {}
         self._audio_index_ready = False
         self._table_build = ""
         self._index_lock = threading.Lock()
@@ -1173,6 +1283,8 @@ class ZoneAudioResolver:
             self._soundkit_to_files = None
             self._kit_profiles = None
             self._kit_profiles_failed_at = -1e9
+            self._weather_presets = None
+            self._weather_intervals = {}
             self._audio_index_ready = False
 
     def install_zones(self, zones: list[ZoneInfo]) -> list[ZoneInfo]:
@@ -1406,7 +1518,126 @@ class ZoneAudioResolver:
         silence = None
         if entry.source_type == "ZoneMusic":
             silence = self.music_silence_ms(entry.source_id)
-        return describe_playback(entry, self.kit_profile(entry.sound_kit_id), silence)
+        weather_interval = None
+        if entry.source_type == WEATHER_DETAIL:
+            weather_interval = self._weather_intervals.get(entry.sound_kit_id) or DEFAULT_THUNDER_INTERVAL_MS
+        return describe_playback(entry, self.kit_profile(entry.sound_kit_id), silence, weather_interval)
+
+    def weather_presets(self, resolve_names, find_paths) -> list[WeatherPreset]:
+        """Build the weather list for this build once.
+
+        resolve_names maps FileDataIDs to client paths; find_paths finds listfile paths by pattern.
+        """
+        if self._weather_presets is not None:
+            return self._weather_presets
+        self._ensure_maps_for_ambient()
+        self._ensure_soundkit_entry_index()
+        assert self._sound_ambience_map is not None and self._soundkit_to_files is not None
+        try:
+            weather_rows = self.db.read_table_rows("Weather", self._table_build)
+        except Exception as exc:  # noqa: BLE001
+            self.logger(f"Weather is unavailable for this build: {exc}")
+            self._weather_presets = []
+            return []
+        try:
+            lightning_rows = self.db.read_table_rows("Lightning", self._table_build)
+        except Exception:  # noqa: BLE001
+            lightning_rows = []
+
+        kit_files = self._soundkit_to_files
+        candidates: list[tuple[int, int, int]] = []  # (weather id, loop kit, start kit)
+        for row in weather_rows:
+            ambience = self._sound_ambience_map.get(_to_int(row.get("SoundAmbienceID"))) or {}
+            loop_kit = _to_int(ambience.get("AmbienceID_0")) or _to_int(row.get("AmbienceID"))
+            if loop_kit and kit_files.get(loop_kit):
+                candidates.append((_to_int(row.get("ID")), loop_kit, _to_int(ambience.get("AmbienceStartID_0"))))
+
+        first_files = [kit_files[kit][0] for _wid, kit, _start in candidates]
+        first_files += [kit_files[start][0] for _wid, _kit, start in candidates if kit_files.get(start)]
+        names = resolve_names(first_files)
+        best: dict[str, tuple[tuple, WeatherPreset]] = {}
+        for weather_id, loop_kit, start_kit in candidates:
+            path = (names.get(kit_files[loop_kit][0]) or "").lower()
+            label = next((name for name, pattern in WEATHER_PRESETS if re.search(pattern, path)), None)
+            if not label:
+                continue
+            profile = (self._kit_profiles or {}).get(loop_kit, {})
+            details: list[int] = []
+            if start_kit and kit_files.get(start_kit) and not (self._kit_profiles or {}).get(start_kit, {}).get("looping"):
+                start_path = (names.get(kit_files[start_kit][0]) or "").lower()
+                # Some rows borrow a zone's own sounds (the Maw, say). Keep only weather-like one-shots.
+                if re.search(WEATHER_DETAIL_PATTERN, start_path):
+                    details = [start_kit]
+            # Prefer the modern looping stereo files over the old one-shot versions.
+            score = (bool(profile.get("looping")), "fx_weather" in path, len(kit_files[loop_kit]), len(details), -weather_id)
+            if label not in best or score > best[label][0]:
+                best[label] = (score, WeatherPreset(label, weather_id, loop_kit, details))
+
+        presets = [best[name][1] for name, _pattern in WEATHER_PRESETS if name in best]
+
+        thunder_kits = self._find_thunder_kits(lightning_rows, resolve_names, find_paths)
+        if thunder_kits and "Rain (heavy)" in best:
+            rain = best["Rain (heavy)"][1]
+            presets.append(WeatherPreset(THUNDERSTORM_LABEL, rain.weather_id, rain.loop_kit, thunder_kits))
+
+        self._weather_intervals = {}
+        for preset in presets:
+            for kit in preset.detail_kits:
+                self._weather_intervals[kit] = preset.detail_interval_ms or DEFAULT_THUNDER_INTERVAL_MS
+        self._weather_presets = presets
+        self.logger(f"Weather presets: {', '.join(preset.label for preset in presets) or 'none'}.")
+        return presets
+
+    def _find_thunder_kits(self, lightning_rows, resolve_names, find_paths) -> list[int]:
+        """Pick thunder by file name. Retail's Lightning table points at spell sounds, not thunder."""
+        assert self._soundkit_to_files is not None
+        kit_files = self._soundkit_to_files
+        lightning_kits = []
+        for row in lightning_rows:
+            for i in range(3):
+                kit = _to_int(row.get(f"SoundKitID_{i}"))
+                if kit and kit_files.get(kit) and kit not in lightning_kits:
+                    lightning_kits.append(kit)
+        if lightning_kits:
+            names = resolve_names([kit_files[kit][0] for kit in lightning_kits])
+            real = [kit for kit in lightning_kits if re.search(r"thunder", names.get(kit_files[kit][0]) or "", re.IGNORECASE)]
+            if real:
+                return real
+        try:
+            thunder_files = set(find_paths(r"^sound/(ambience|emitters|doodad)/.*thunder.*\.ogg$"))
+        except Exception as exc:  # noqa: BLE001
+            self.logger(f"Could not search for thunder sounds: {exc}")
+            return []
+        best_kit, best_count = 0, 0
+        for kit, files in kit_files.items():
+            if len(files) < 2:
+                continue
+            count = sum(1 for file_data_id in files if file_data_id in thunder_files)
+            # A thunder kit is made of thunder; skip kits that only include one or two strikes.
+            if count * 2 >= len(files) and count > best_count:
+                best_kit, best_count = kit, count
+        return [best_kit] if best_kit else []
+
+    def weather_entries_for_zone(self, zone: ZoneInfo, presets: list[WeatherPreset]) -> list[AudioEntry]:
+        assert self._soundkit_to_files is not None
+        entries: list[AudioEntry] = []
+        for preset in presets:
+            parts = [(preset.loop_kit, WEATHER_LOOP)] + [(kit, WEATHER_DETAIL) for kit in preset.detail_kits]
+            for kit, source_type in parts:
+                for file_data_id in self._soundkit_to_files.get(kit, []):
+                    entries.append(
+                        AudioEntry(
+                            zone_id=zone.area_id,
+                            zone_name=zone.friendly_name,
+                            category="weather",
+                            sound_kit_id=kit,
+                            file_data_id=file_data_id,
+                            source_type=source_type,
+                            source_id=preset.weather_id,
+                            hint=preset.label,
+                        )
+                    )
+        return entries
 
     def _remember_kit(
         self,
@@ -1638,6 +1869,7 @@ class App(tk.Tk):
         self.extract_music_var = tk.BooleanVar(value=True)
         self.extract_ambient_var = tk.BooleanVar(value=True)
         self.include_subzone_music_var = tk.BooleanVar(value=False)
+        self.include_weather_var = tk.BooleanVar(value=True)
         self.format_var = tk.StringVar(value="mp3")
         self.asset_search_var = tk.StringVar()
         self.asset_type_var = tk.StringVar(value="All")
@@ -1802,7 +2034,8 @@ class App(tk.Tk):
         ttk.Separator(row2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
         ttk.Checkbutton(row2, text="Music", variable=self.extract_music_var).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Checkbutton(row2, text="Ambient", variable=self.extract_ambient_var).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Checkbutton(row2, text="Subzone music", variable=self.include_subzone_music_var).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(row2, text="Subzone music", variable=self.include_subzone_music_var).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Checkbutton(row2, text="Weather", variable=self.include_weather_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(row2, text="Format", style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Combobox(row2, textvariable=self.format_var, values=tuple(AUDIO_FORMATS), width=5, state="readonly").pack(side=tk.LEFT)
 
@@ -2005,7 +2238,7 @@ class App(tk.Tk):
         self.log_text.configure(state=tk.DISABLED)
         self.asset_type_combo.configure(values=("All",))
         self.asset_time_combo.configure(values=("All",))
-        self.asset_role_combo.configure(values=("All", "Bed", "Atmosphere", "Detail", "Music", "Intro"))
+        self.asset_role_combo.configure(values=("All", "Bed", "Atmosphere", "Detail", "Music", "Intro", "Weather"))
         self._reset_inspector()
 
     def _log_ui(self, message: str) -> None:
@@ -2364,10 +2597,11 @@ class App(tk.Tk):
         include_music = bool(self.extract_music_var.get())
         include_ambient = bool(self.extract_ambient_var.get())
         include_subzone_music = bool(self.include_subzone_music_var.get())
-        if not include_music and not include_ambient:
+        include_weather = bool(self.include_weather_var.get())
+        if not include_music and not include_ambient and not include_weather:
             self.asset_entries = []
             self.asset_entry_map.clear()
-            self.asset_summary_var.set("Enable Music and/or Ambient Sounds to retrieve assets.")
+            self.asset_summary_var.set("Enable Music, Ambient or Weather to retrieve clips.")
             self._render_asset_tree()
             self._reset_inspector()
             return False
@@ -2379,6 +2613,7 @@ class App(tk.Tk):
             include_music,
             include_ambient,
             include_subzone_music,
+            include_weather,
             zone_token,
             warn_if_busy=False,
         )
@@ -2393,6 +2628,7 @@ class App(tk.Tk):
         include_music: bool,
         include_ambient: bool,
         include_subzone_music: bool,
+        include_weather: bool,
         zone_token: tuple[int, ...],
     ) -> None:
         try:
@@ -2425,6 +2661,11 @@ class App(tk.Tk):
                         continue
                     seen_keys.add(key)
                     entries.append(entry)
+                if include_weather:
+                    presets = self.resolver.weather_presets(
+                        self.listfile_cache.resolve_file_names, self.listfile_cache.find_paths
+                    )
+                    entries.extend(self.resolver.weather_entries_for_zone(zone, presets))
             self.ui_queue.put(("status", f"Reading playback for {pretty_count(len(entries))} clips..."))
             playback: dict[str, dict[str, object]] = {}
             for entry in entries:
@@ -2445,6 +2686,9 @@ class App(tk.Tk):
             self.ui_queue.put(("status", "Audio retrieval failed."))
 
     def _entry_key(self, entry: AudioEntry) -> str:
+        if entry.is_weather:
+            # Thunderstorm reuses the heavy rain loop, so weather keys carry the preset name.
+            return f"{entry.zone_id}:weather:{slugify_name(entry.hint, 'weather')}:{entry.file_data_id}"
         return f"{entry.zone_id}:{entry.file_data_id}"
 
     def _resolve_entry_defaults(self, entry: AudioEntry, file_path: str | None) -> dict[str, object]:
@@ -2474,7 +2718,7 @@ class App(tk.Tk):
                 override["description"] = resolved.get("description", entry.default_description)
             if resolved.get("lookup_path"):
                 override["lookup_path"] = resolved["lookup_path"]
-            override.setdefault("checked", True)
+            override.setdefault("checked", not entry.is_weather)  # Weather is opt-in.
 
     def _entry_override(self, entry: AudioEntry) -> dict[str, object]:
         key = self._entry_key(entry)
@@ -2496,7 +2740,7 @@ class App(tk.Tk):
         return bool(self._entry_override(entry).get("tagged", False))
 
     def _entry_checked(self, entry: AudioEntry) -> bool:
-        return bool(self._entry_override(entry).get("checked", True))
+        return bool(self._entry_override(entry).get("checked", not entry.is_weather))
 
     def _entry_playback(self, entry: AudioEntry) -> dict[str, object]:
         # Worked out on the retrieval thread. The UI thread never builds tables.
@@ -2527,7 +2771,7 @@ class App(tk.Tk):
             ids = layer["file_data_ids"]
             assert isinstance(ids, list)
             ids.append(entry.file_data_id)
-        role_order = {"Bed": 0, "Atmosphere": 1, "Detail": 2, "Music": 3, "Intro": 4}
+        role_order = {"Bed": 0, "Atmosphere": 1, "Detail": 2, "Music": 3, "Intro": 4, "Weather": 5}
         return sorted(grouped.values(), key=lambda item: (role_order.get(str(item.get("role")), 9), str(item.get("time_of_day"))))
 
     def _refresh_recipe_label(self) -> None:
@@ -2616,7 +2860,7 @@ class App(tk.Tk):
             self.selection_summary_var.set("No asset selected.")
             return
 
-        role_order = {"Bed": 0, "Atmosphere": 1, "Detail": 2, "Music": 3, "Intro": 4}
+        role_order = {"Bed": 0, "Atmosphere": 1, "Detail": 2, "Music": 3, "Intro": 4, "Weather": 5}
         filtered_entries.sort(
             key=lambda entry: (
                 entry.area_label.lower(),
@@ -2807,7 +3051,7 @@ class App(tk.Tk):
         updated = 0
         for entry in entries:
             override = self._entry_override(entry)
-            if bool(override.get("checked", True)) != checked:
+            if self._entry_checked(entry) != checked:
                 updated += 1
             override["checked"] = checked
         return updated
@@ -3442,6 +3686,8 @@ class App(tk.Tk):
                 self.extract_ambient_var.set(bool(body.get("include_ambient")))
             if "include_subzone_music" in body:
                 self.include_subzone_music_var.set(bool(body.get("include_subzone_music")))
+            if "include_weather" in body:
+                self.include_weather_var.set(bool(body.get("include_weather")))
             chosen = self._select_zone_ids([zone.area_id])
             if not chosen:
                 box["result"] = {"ok": False, "error": f"Could not select {zone.friendly_name}."}

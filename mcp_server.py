@@ -29,7 +29,7 @@ PORT = 47221
 HOST = f"http://{HOST_ADDR}:{PORT}"
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "wow_zone_audio_extractor_gui.py")
-SERVER_INFO = {"name": "wow-ambient", "version": "0.4.4"}
+SERVER_INFO = {"name": "wow-ambient", "version": "0.5.0"}
 INSTRUCTIONS = (
     "WoW Zone Audio Extractor is a desktop app. These tools drive the open window. "
     "A zone ambience is separate clocks: Bed (one seamless loop, birds live inside it), "
@@ -70,7 +70,7 @@ TOOLS = [
     },
     {
         "name": "wow_open_zone",
-        "description": "Select one zone in the window and retrieve its music and ambience clips.",
+        "description": "Select one zone in the window and retrieve its music, ambience and weather clips. Weather clips start unchecked; check the presets you want.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -79,6 +79,7 @@ TOOLS = [
                 "include_music": {"type": "boolean"},
                 "include_ambient": {"type": "boolean"},
                 "include_subzone_music": {"type": "boolean"},
+                "include_weather": {"type": "boolean"},
             },
         },
     },
@@ -89,7 +90,7 @@ TOOLS = [
     },
     {
         "name": "wow_clips",
-        "description": "List loaded clips. Filter by role (Bed, Atmosphere, Detail, Music, Intro), time, or a text query.",
+        "description": "List loaded clips. Filter by role (Bed, Atmosphere, Detail, Music, Intro, Weather), time, or a text query.",
         "inputSchema": {
             "type": "object",
             "properties": {
