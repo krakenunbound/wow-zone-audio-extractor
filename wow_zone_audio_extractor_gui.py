@@ -32,7 +32,7 @@ from agent_bridge import AgentBridge, AGENT_PORT
 
 
 APP_TITLE = "WoW Zone Audio Extractor"
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 WAGO_DB_INDEX_URL = "https://wago.tools/db2"
 WAGO_DB_TABLE_URL = "https://wago.tools/db2/{table}/csv?build={build}&locale=enUS"
 WAGO_CASC_URL = "https://wago.tools/api/casc/{file_data_id}"
@@ -40,6 +40,7 @@ USER_AGENT = f"{APP_TITLE}/{APP_VERSION}"
 EXPORT_INDEX_FILENAME = "wow_zone_audio_export.json"
 ZONE_MANIFEST_FILENAME = "zone_manifest.json"
 WOW_LISTFILE_URL = "https://github.com/wowdev/wow-listfile/releases/latest/download/community-listfile.csv"
+LISTFILE_MAX_AGE_SECONDS = 30 * 24 * 3600  # New clips get names after a refresh.
 
 # Maps WoW expansion content-patch prefixes found in filenames to friendly labels.
 EXPANSION_PREFIX_MAP: dict[str, str] = {
@@ -81,6 +82,15 @@ def sanitize_path_name(name: str, fallback: str) -> str:
 def slugify_name(name: str, fallback: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
     return cleaned if cleaned else fallback
+
+
+def mentions_time(hint: str | None, word: str) -> bool:
+    """True when the hint names day or night as a word ("DuskwoodNight", "night layer").
+
+    A plain substring test misreads "DeathKnight" as night and "Holiday" as day.
+    """
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", hint or "").lower()
+    return re.search(rf"(?<![a-z]){word}", text) is not None
 
 
 def pretty_count(value: int) -> str:
@@ -184,9 +194,23 @@ def parse_wago_db_index() -> dict:
     return json.loads(payload)
 
 
+# Each client folder holds one of these. Classic, Classic Era and Anniversary use
+# WowClassic.exe; betas and PTRs add B or T.
+WOW_EXE_NAMES = ("Wow.exe", "WowClassic.exe", "WowB.exe", "WowT.exe", "WowClassicB.exe", "WowClassicT.exe")
+
+
+def find_wow_exe(folder: Path) -> Path | None:
+    for name in WOW_EXE_NAMES:
+        candidate = folder / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def detect_retail_dir(path: Path) -> Path | None:
+    """Return the client folder (_retail_, _classic_, ...) for a client or WoW root path."""
     path = path.expanduser().resolve()
-    if (path / "Wow.exe").exists() and (path / "Interface").exists():
+    if find_wow_exe(path):
         return path
     if (path / "_retail_" / "Wow.exe").exists():
         return (path / "_retail_").resolve()
@@ -194,7 +218,7 @@ def detect_retail_dir(path: Path) -> Path | None:
 
 
 def detect_wow_root_from_retail(retail_dir: Path) -> Path:
-    if retail_dir.name.lower() == "_retail_":
+    if (retail_dir.parent / ".build.info").exists():
         return retail_dir.parent
     return retail_dir
 
@@ -371,12 +395,13 @@ def discover_wow_installs(root: Path) -> list[WowInstall]:
     except OSError:
         return []
     for folder in folders:
-        if not (folder / "Wow.exe").exists() or not (folder / ".flavor.info").exists():
+        exe = find_wow_exe(folder)
+        if exe is None or not (folder / ".flavor.info").exists():
             continue
         product = _flavor_product(folder)
         if not product:
             continue
-        version = versions.get(product) or exe_file_version(folder / "Wow.exe")
+        version = versions.get(product) or exe_file_version(exe)
         if not version:
             continue
         installs.append(
@@ -397,25 +422,143 @@ def find_ffmpeg() -> Path | None:
         return Path(direct)
 
     candidates = [
-        Path(
-            r"C:\Users\The Kraken\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
-        ),
         Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
         Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    return None
+    # WinGet installs ffmpeg under a versioned folder and does not always add it to PATH.
+    winget = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Microsoft" / "WinGet" / "Packages"
+    try:
+        found = sorted(winget.glob("*FFmpeg*/*/bin/ffmpeg.exe"), reverse=True)
+    except OSError:
+        found = []
+    return found[0] if found else None
+
+
+AUDIO_FORMATS: dict[str, list[str]] = {
+    "mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
+    "ogg": ["-c:a", "libvorbis", "-q:a", "5"],
+    "flac": ["-c:a", "flac"],
+    "wav": ["-c:a", "pcm_s16le"],
+    "m4a": ["-c:a", "aac", "-b:a", "192k"],
+}
 
 
 def ffmpeg_args_for_format(fmt: str) -> tuple[str, list[str]]:
-    fmt = fmt.lower().strip()
-    if fmt == "wav":
-        return "wav", ["-c:a", "pcm_s16le"]
-    if fmt == "m4a":
-        return "m4a", ["-c:a", "aac", "-b:a", "192k"]
-    return "mp3", ["-c:a", "libmp3lame", "-b:a", "192k"]
+    fmt = (fmt or "").lower().strip().lstrip(".")
+    if fmt not in AUDIO_FORMATS:
+        raise ValueError(f"Unsupported format {fmt!r}. Use one of: {', '.join(AUDIO_FORMATS)}.")
+    return fmt, list(AUDIO_FORMATS[fmt])
+
+
+def run_hidden(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Run a console tool without flashing a console window from pythonw."""
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, creationflags=flags)
+
+
+MAX_TITLE_IN_FILENAME = 80
+
+
+def group_dir_name(entry: "AudioEntry") -> str:
+    return f"{entry.type_label}__{entry.group_label}"
+
+
+def group_dir_key(entry: "AudioEntry") -> tuple[str, str, str, str]:
+    """The full folder path below the zone. Kits that share it would overwrite each other's manifest."""
+    return (entry.category_slug, entry.time_of_day, entry.mood_label, group_dir_name(entry))
+
+
+def remove_stale_copies(group_dir: Path, file_data_id: int, ext: str, keep: Path) -> None:
+    """Delete this clip's earlier exports in the folder (another number or title)."""
+    for old in group_dir.glob(f"[0-9][0-9][0-9]__fd{file_data_id}__*.{ext}"):
+        if old != keep:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+def merge_manifest_rows(path: Path, new_rows: list[dict], zone_root: Path) -> list[dict]:
+    """Keep rows from an earlier export whose files still exist and were not exported again."""
+    new_ids = {_to_int(row.get("file_data_id")) for row in new_rows}
+    kept: list[dict] = []
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    file_data_id = _to_int(row.get("file_data_id"))
+                    relative = row.get("relative_path") or ""
+                    if file_data_id and file_data_id not in new_ids and relative and (zone_root / relative).exists():
+                        kept.append(row)
+        except (OSError, csv.Error, UnicodeDecodeError):
+            kept = []
+    return kept + list(new_rows)
+
+
+def write_manifest_csv(path: Path, rows: list[dict]) -> None:
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, restval="", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def merge_zone_groups(path: Path, new_groups: list[dict], zone_root: Path) -> list[dict]:
+    """Fold an earlier zone_manifest.json's groups into this run's groups."""
+    new_ids = {_to_int(item.get("file_data_id")) for group in new_groups for item in group.get("files", [])}
+    merged: dict[str, dict] = {str(group["id"]): group for group in new_groups}
+    order = list(merged)
+    old_groups = _read_json_dict(path).get("groups")
+    for group in old_groups if isinstance(old_groups, list) else []:
+        if not isinstance(group, dict) or not isinstance(group.get("files"), list):
+            continue
+        kept = [
+            item
+            for item in group["files"]
+            if isinstance(item, dict)
+            and _to_int(item.get("file_data_id")) not in new_ids
+            and item.get("relative_path")
+            and (zone_root / str(item["relative_path"])).exists()
+        ]
+        if not kept:
+            continue
+        group_id = str(group.get("id"))
+        if group_id in merged:
+            merged[group_id]["files"] = kept + list(merged[group_id]["files"])
+        else:
+            merged[group_id] = dict(group, files=kept)
+            order.append(group_id)
+    return [merged[group_id] for group_id in order]
+
+
+def merge_export_zones(path: Path, new_zones: list[dict], output_dir: Path) -> list[dict]:
+    """Keep zones from earlier runs in the export index while their manifests exist."""
+    new_ids = {_to_int(row.get("zone_id")) for row in new_zones}
+    old_zones = _read_json_dict(path).get("zones")
+    kept = [
+        row
+        for row in (old_zones if isinstance(old_zones, list) else [])
+        if isinstance(row, dict)
+        and _to_int(row.get("zone_id")) not in new_ids
+        and row.get("manifest")
+        and (output_dir / str(row["manifest"])).exists()
+    ]
+    return kept + list(new_zones)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -515,9 +658,9 @@ class AudioEntry:
             return hint or "Zone Music"
 
         if self.source_type == "SoundAmbienceFlavor":
-            if "night" in hint_lower and "any " not in hint_lower:
+            if mentions_time(self.hint, "night") and "any " not in hint_lower:
                 return "Night Details"
-            if "day" in hint_lower and "any " not in hint_lower:
+            if mentions_time(self.hint, "day") and "any " not in hint_lower:
                 return "Day Details"
             return "Ambient Details"
 
@@ -530,22 +673,22 @@ class AudioEntry:
 
         # Distinguish ambient loops (nature/forest) from atmosphere (wind/weather)
         if "ambient loop" in hint_lower:
-            if "night" in hint_lower:
+            if mentions_time(self.hint, "night"):
                 return "Night Ambient Loop"
-            if "day" in hint_lower:
+            if mentions_time(self.hint, "day"):
                 return "Day Ambient Loop"
             return "Ambient Loop"
 
         if "ambient start" in hint_lower or "ambient stop" in hint_lower:
-            if "night" in hint_lower:
+            if mentions_time(self.hint, "night"):
                 return "Night Transition"
-            if "day" in hint_lower:
+            if mentions_time(self.hint, "day"):
                 return "Day Transition"
             return "Ambient Transition"
 
-        if "night" in hint_lower:
+        if mentions_time(self.hint, "night"):
             return "Night Atmosphere"
-        if "day" in hint_lower:
+        if mentions_time(self.hint, "day"):
             return "Day Atmosphere"
 
         layer_match = re.search(r"(\d+)$", hint)
@@ -581,9 +724,9 @@ class AudioEntry:
     @property
     def time_of_day(self) -> str:
         hint_lower = (self.hint or "").lower()
-        if "night" in hint_lower:
+        if mentions_time(self.hint, "night"):
             return "Night"
-        if "day" in hint_lower:
+        if mentions_time(self.hint, "day"):
             return "Day"
         return "Any"
 
@@ -909,17 +1052,38 @@ class ListfileCache:
         self.logger = logger
         self.listfile_path = self.cache_root / "community-listfile.csv"
         self._lookup_cache: dict[int, str | None] = {}
+        self._download_lock = threading.Lock()
 
     def ensure_listfile(self) -> Path:
         self.cache_root.mkdir(parents=True, exist_ok=True)
-        if self.listfile_path.exists() and self.listfile_path.stat().st_size > 1024:
-            return self.listfile_path
+        with self._download_lock:
+            have = self.listfile_path.exists() and self.listfile_path.stat().st_size > 1024
+            if have and time.time() - self.listfile_path.stat().st_mtime < LISTFILE_MAX_AGE_SECONDS:
+                return self.listfile_path
 
-        self.logger("Downloading community WoW listfile for filename lookups...")
-        req = urllib.request.Request(WOW_LISTFILE_URL, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=240) as response, self.listfile_path.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
-        return self.listfile_path
+            self.logger(
+                "Refreshing the community WoW listfile..." if have
+                else "Downloading community WoW listfile for filename lookups..."
+            )
+            # Download beside the real file and swap it in only when complete.
+            # A cut-off download must never pass for the whole listfile.
+            partial = self.listfile_path.with_suffix(".csv.part")
+            try:
+                req = urllib.request.Request(WOW_LISTFILE_URL, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=240) as response, partial.open("wb") as handle:
+                    expected = _to_int(response.headers.get("Content-Length"))
+                    shutil.copyfileobj(response, handle)
+                if expected and partial.stat().st_size != expected:
+                    raise RuntimeError(f"listfile download stopped at {partial.stat().st_size} of {expected} bytes")
+                partial.replace(self.listfile_path)
+                self._lookup_cache.clear()
+            except Exception as exc:  # noqa: BLE001
+                partial.unlink(missing_ok=True)
+                if not have:
+                    raise
+                self.logger(f"Listfile refresh failed, keeping the saved copy: {exc}")
+                os.utime(self.listfile_path)  # Do not retry on every lookup.
+            return self.listfile_path
 
     def lookup_file_name(self, file_data_id: int) -> str | None:
         if file_data_id <= 0:
@@ -988,6 +1152,7 @@ class ZoneAudioResolver:
         self._ambience_flavor_map: dict[int, list[dict[str, str]]] | None = None
         self._soundkit_to_files: dict[int, list[int]] | None = None
         self._kit_profiles: dict[int, dict[str, object]] | None = None
+        self._kit_profiles_failed_at = -1e9
         self._audio_index_ready = False
         self._table_build = ""
         self._index_lock = threading.Lock()
@@ -1007,6 +1172,7 @@ class ZoneAudioResolver:
             self._ambience_flavor_map = None
             self._soundkit_to_files = None
             self._kit_profiles = None
+            self._kit_profiles_failed_at = -1e9
             self._audio_index_ready = False
 
     def install_zones(self, zones: list[ZoneInfo]) -> list[ZoneInfo]:
@@ -1020,7 +1186,8 @@ class ZoneAudioResolver:
         self.logger(f"Built parent->child index: {pretty_count(len(child_map))} parent zones with sub-areas.")
         return self._zones
 
-    def install_audio_index(self, payload: dict) -> bool:
+    def install_audio_index(self, payload: dict, blocking: bool = True) -> bool | None:
+        """Install a saved index. With blocking=False, return None if a worker holds the lock."""
         if not isinstance(payload, dict) or payload.get("v") != 1:
             return False
         needed = (
@@ -1033,7 +1200,9 @@ class ZoneAudioResolver:
         )
         if any(name not in payload or not isinstance(payload[name], dict) for name in needed):
             return False
-        with self._index_lock:
+        if not self._index_lock.acquire(blocking=blocking):
+            return None
+        try:
             self._zone_music_map = payload["zone_music_map"]
             self._zone_intro_map = payload["zone_intro_map"]
             self._sound_ambience_map = payload["sound_ambience_map"]
@@ -1041,6 +1210,8 @@ class ZoneAudioResolver:
             self._soundkit_to_files = payload["soundkit_to_files"]
             self._kit_profiles = payload["kit_profiles"]
             self._audio_index_ready = True
+        finally:
+            self._index_lock.release()
         return True
 
     def load_zones(self, build: str) -> list[ZoneInfo]:
@@ -1184,10 +1355,12 @@ class ZoneAudioResolver:
     def _ensure_kit_profiles(self) -> None:
         if self._kit_profiles is not None:
             return
+        if time.monotonic() - self._kit_profiles_failed_at < 60:
+            return  # Failed recently. Retry after a minute rather than on every clip.
         with self._index_lock:
             if self._kit_profiles is not None:
                 return
-            self._kit_profiles = {}
+            profiles: dict[int, dict[str, object]] = {}
             try:
                 self.logger("Indexing SoundKit and SoundKitAdvanced...")
                 advanced: dict[int, dict[str, str]] = {}
@@ -1201,15 +1374,21 @@ class ZoneAudioResolver:
                     if soundkit_id <= 0:
                         continue
                     advanced_row = advanced.get(_to_int(row.get("SoundKitAdvancedID")))
-                    self._kit_profiles[soundkit_id] = profile_from_kit_rows(row, advanced_row)
+                    try:
+                        profiles[soundkit_id] = profile_from_kit_rows(row, advanced_row)
+                    except ValueError:
+                        continue
                     count += 1
+                self._kit_profiles = profiles
                 self.logger(f"Sound kit profiles ready: {pretty_count(count)} kits.")
             except Exception as exc:  # noqa: BLE001
-                self.logger(f"Sound kit profiles unavailable: {exc}")
+                self._kit_profiles_failed_at = time.monotonic()
+                self.logger(f"Sound kit profiles unavailable, will retry: {exc}")
 
     def kit_profile(self, soundkit_id: int) -> dict[str, object]:
         self._ensure_kit_profiles()
-        assert self._kit_profiles is not None
+        if self._kit_profiles is None:
+            return {}
         return dict(self._kit_profiles.get(soundkit_id) or {})
 
     def music_silence_ms(self, zone_music_id: int) -> tuple[int, int] | None:
@@ -1427,8 +1606,10 @@ class App(tk.Tk):
         self.asset_entries: list[AudioEntry] = []
         self.asset_entry_map: dict[str, AudioEntry] = {}
         self.entry_overrides: dict[str, dict[str, object]] = {}
+        self.entry_playback: dict[str, dict[str, object]] = {}
         self.selected_entry_key: str | None = None
         self.zone_refresh_after_id: str | None = None
+        self._pending_asset_refresh = False
         self._bridge_job: dict | None = None
         self._agent_seen_at = 0.0
         self._index_generation = 0
@@ -1447,7 +1628,8 @@ class App(tk.Tk):
         self.resolver = ZoneAudioResolver(self.db, logger=self._log_from_worker)
 
         self.wow_path_var = tk.StringVar()
-        self.output_path_var = tk.StringVar(value=r"F:\WoW-Ambient")
+        # Default to the app folder; exports land in its zones\ subfolder.
+        self.output_path_var = tk.StringVar(value=str(Path(__file__).resolve().parent))
         self.build_var = tk.StringVar()
         self.version_var = tk.StringVar()
         self._installs: list[WowInstall] = []
@@ -1622,7 +1804,7 @@ class App(tk.Tk):
         ttk.Checkbutton(row2, text="Ambient", variable=self.extract_ambient_var).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Checkbutton(row2, text="Subzone music", variable=self.include_subzone_music_var).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(row2, text="Format", style="CardTitle.TLabel").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(row2, textvariable=self.format_var, values=("mp3", "wav", "m4a"), width=5, state="readonly").pack(side=tk.LEFT)
+        ttk.Combobox(row2, textvariable=self.format_var, values=tuple(AUDIO_FORMATS), width=5, state="readonly").pack(side=tk.LEFT)
 
         # ── Three-Panel Body ──
         body = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
@@ -2060,23 +2242,32 @@ class App(tk.Tk):
             return
         self.build_var.set(build)
         self._set_status(f"Loading zones for {build}...")
-        self._run_worker(self._worker_load_zones, False)
+        self._start_load_zones(False)
 
     def _load_zones_clicked(self) -> None:
-        self._run_worker(self._worker_load_zones, False)
+        self._start_load_zones(False)
 
-    def _worker_load_zones(self, force: bool = False) -> None:
+    def _start_load_zones(self, force: bool, warn_if_busy: bool = True) -> bool:
+        # Read Tk variables here, on the UI thread. Workers must not touch Tk.
+        return self._run_worker(
+            self._worker_load_zones,
+            force,
+            self.wow_path_var.get().strip(),
+            self.build_var.get().strip(),
+            warn_if_busy=warn_if_busy,
+        )
+
+    def _worker_load_zones(self, force: bool, wow_dir_raw: str, typed_build: str) -> None:
         try:
             self.ui_queue.put(("status", "Loading zones..."))
             self.ui_queue.put(("progress", 5.0))
-            wow_dir_raw = self.wow_path_var.get().strip()
             retail = detect_retail_dir(Path(wow_dir_raw)) if wow_dir_raw else None
             if not retail:
-                raise RuntimeError("WoW folder is invalid. Pick your main WoW folder or _retail_ folder.")
+                raise RuntimeError("WoW folder is invalid. Pick your main WoW folder or a client folder such as _retail_.")
 
             wow_root = detect_wow_root_from_retail(retail)
             local_build = parse_local_retail_build(wow_root)
-            desired_build = self.build_var.get().strip() or (local_build or "")
+            desired_build = typed_build or (local_build or "")
 
             if not desired_build:
                 desired_build = self.db.get_latest_build(preferred_major=12)
@@ -2130,9 +2321,11 @@ class App(tk.Tk):
         self._schedule_asset_refresh()
 
     def _clear_zone_selection(self) -> None:
+        self._persist_current_editor()
         self.zone_listbox.selection_clear(0, tk.END)
         self.asset_entries = []
         self.asset_entry_map.clear()
+        self.entry_playback = {}
         self._render_asset_tree()
         self.asset_summary_var.set("No zones selected.")
         self._reset_inspector()
@@ -2190,6 +2383,7 @@ class App(tk.Tk):
             warn_if_busy=False,
         )
         if not started:
+            self._pending_asset_refresh = True
             self._set_status("Busy. Retrieval will refresh after the current task finishes.")
         return bool(started)
 
@@ -2205,24 +2399,46 @@ class App(tk.Tk):
             zone_names = ", ".join(zone.friendly_name for zone in zones[:3])
             if len(zones) > 3:
                 zone_names += f" +{len(zones) - 3} more"
+            build = self._loaded_build
+            index_thread = self._index_threads.get(build)
+            if index_thread and index_thread.is_alive():
+                # Building the same tables twice wastes minutes. Wait for the index job.
+                self.ui_queue.put(("status", f"Waiting for sound indexes for {build}..."))
+                index_thread.join()
+            payload = self._index_payloads.get(build)
+            if payload and not self.resolver.audio_index_ready:
+                self.resolver.install_audio_index(payload)
+
             self.ui_queue.put(("status", f"Retrieving audio for {zone_names}..."))
             entries: list[AudioEntry] = []
+            seen_keys: set[str] = set()
             for zone in zones:
-                entries.extend(
-                    self.resolver.entries_for_zone(
-                        zone,
-                        include_music=include_music,
-                        include_ambient=include_ambient,
-                        include_foreign_child_music=include_subzone_music,
-                    )
-                )
+                for entry in self.resolver.entries_for_zone(
+                    zone,
+                    include_music=include_music,
+                    include_ambient=include_ambient,
+                    include_foreign_child_music=include_subzone_music,
+                ):
+                    # A parent zone carries its subzones' clips. Selecting both must not list a clip twice.
+                    key = self._entry_key(entry)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    entries.append(entry)
+            self.ui_queue.put(("status", f"Reading playback for {pretty_count(len(entries))} clips..."))
+            playback: dict[str, dict[str, object]] = {}
+            for entry in entries:
+                try:
+                    playback[self._entry_key(entry)] = self.resolver.playback_for(entry)
+                except Exception:  # noqa: BLE001
+                    playback[self._entry_key(entry)] = describe_playback(entry, None, None)
             self.ui_queue.put(("status", f"Resolving friendly names for {pretty_count(len(entries))} clips..."))
             lookup_map = self.listfile_cache.resolve_file_names([entry.file_data_id for entry in entries])
             resolved_defaults = {
                 self._entry_key(entry): self._resolve_entry_defaults(entry, lookup_map.get(entry.file_data_id))
                 for entry in entries
             }
-            self.ui_queue.put(("assets_ready", zone_token, entries, resolved_defaults))
+            self.ui_queue.put(("assets_ready", zone_token, entries, resolved_defaults, playback))
             self.ui_queue.put(("status", f"Retrieved {pretty_count(len(entries))} clips from {pretty_count(len(zones))} zone(s)."))
         except Exception as exc:  # noqa: BLE001
             self.ui_queue.put(("error", f"Audio retrieval failed: {exc}"))
@@ -2283,10 +2499,11 @@ class App(tk.Tk):
         return bool(self._entry_override(entry).get("checked", True))
 
     def _entry_playback(self, entry: AudioEntry) -> dict[str, object]:
-        try:
-            return self.resolver.playback_for(entry)
-        except Exception:  # noqa: BLE001
-            return describe_playback(entry, None, None)
+        # Worked out on the retrieval thread. The UI thread never builds tables.
+        cached = self.entry_playback.get(self._entry_key(entry))
+        if cached is not None:
+            return cached
+        return describe_playback(entry, None, None)
 
     def _layer_summary(self, entries: list[AudioEntry] | None = None) -> list[dict[str, object]]:
         chosen = self.asset_entries if entries is None else entries
@@ -2395,6 +2612,7 @@ class App(tk.Tk):
         )
 
         if not filtered_entries:
+            self._reset_inspector()
             self.selection_summary_var.set("No asset selected.")
             return
 
@@ -2542,6 +2760,10 @@ class App(tk.Tk):
             self._reset_inspector()
 
     def _reset_inspector(self) -> None:
+        # Save the open clip, then forget it. Otherwise the emptied editor is later
+        # written back into that clip and wipes its title and description.
+        self._persist_current_editor()
+        self.selected_entry_key = None
         self.selection_summary_var.set("Select a clip to edit metadata, tag it, preview it, or extract it.")
         self.meta_area_var.set("-")
         self.meta_type_var.set("-")
@@ -2674,7 +2896,7 @@ class App(tk.Tk):
                     "pcm_s16le",
                     str(preview_file),
                 ]
-                run = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                run = run_hidden(ffmpeg_cmd)
                 if run.returncode != 0 or not preview_file.exists():
                     stderr = (run.stderr or "").strip()
                     raise RuntimeError(stderr or "Preview conversion failed")
@@ -2722,27 +2944,38 @@ class App(tk.Tk):
     def _extract_selected_entries(self) -> None:
         self._start_extract_entries(self._selected_leaf_entries(), "selected clips")
 
-    def _start_extract_entries(self, entries: list[AudioEntry], label: str) -> None:
+    def _start_extract_entries(self, entries: list[AudioEntry], label: str, interactive: bool = True) -> str | None:
+        """Start an extraction. Return None when it started, else the reason.
+
+        interactive=False (agent calls) never opens a dialog, so a request cannot hang on one.
+        """
+
+        def refuse(message: str, error: bool = True) -> str:
+            if interactive:
+                (messagebox.showerror if error else messagebox.showinfo)(APP_TITLE, message)
+            return message
+
         self._persist_current_editor()
         if not entries:
-            messagebox.showinfo(APP_TITLE, f"There are no {label} to extract.")
-            return
+            return refuse(f"There are no {label} to extract.", error=False)
 
-        output_dir = Path(self.output_path_var.get().strip()).expanduser()
-        if not output_dir:
-            messagebox.showerror(APP_TITLE, "Choose an output folder.")
-            return
+        output_raw = self.output_path_var.get().strip()
+        if not output_raw:
+            return refuse("Choose an output folder.")
+        output_dir = Path(output_raw).expanduser()
 
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
-            messagebox.showerror(APP_TITLE, "ffmpeg was not found. Install ffmpeg or add it to PATH.")
-            return
+            return refuse("ffmpeg was not found. Install ffmpeg or add it to PATH.")
 
         fmt = self.format_var.get().strip().lower()
+        try:
+            ffmpeg_args_for_format(fmt)
+        except ValueError as exc:
+            return refuse(str(exc))
         metadata_snapshot = {key: dict(value) for key, value in self.entry_overrides.items()}
         zone_lookup = {zone.area_id: zone for zone in self.zones}
-        self._set_progress(0.0)
-        self._run_worker(
+        started = self._run_worker(
             self._worker_extract,
             entries,
             metadata_snapshot,
@@ -2751,7 +2984,12 @@ class App(tk.Tk):
             ffmpeg,
             fmt,
             label,
+            warn_if_busy=interactive,
         )
+        if not started:
+            return "A task is already running."
+        self._set_progress(0.0)
+        return None
 
     def _worker_extract(
         self,
@@ -2826,6 +3064,22 @@ class App(tk.Tk):
                         )
                     ].append(entry)
 
+                # Two kits can share a label (several "Day Details" kits, say). Give each its own
+                # folder, or their manifest.csv files overwrite each other.
+                # Decide from every clip the zone has, not just this run's, so a later
+                # export of one kit lands in the same folder as before.
+                dir_kits: dict[str, set[int]] = defaultdict(set)
+                try:
+                    all_zone_entries = [
+                        item
+                        for item in self.resolver.entries_for_zone(zone, True, True, include_foreign_child_music=True)
+                        if item.zone_id == zone.area_id
+                    ]
+                except Exception:  # noqa: BLE001
+                    all_zone_entries = []
+                for entry in [*all_zone_entries, *zone_entries]:
+                    dir_kits[group_dir_key(entry)].add(entry.sound_kit_id)
+
                 zone_manifest_rows: list[dict[str, str | int | float]] = []
                 zone_group_payloads: list[dict[str, object]] = []
 
@@ -2840,15 +3094,15 @@ class App(tk.Tk):
                     ),
                 ):
                     exemplar = group[0]
+                    dir_name = group_dir_name(exemplar)
+                    if len(dir_kits[group_dir_key(exemplar)]) > 1:
+                        dir_name = f"{dir_name} (kit {exemplar.sound_kit_id})"
                     group_dir = (
                         zone_root
                         / exemplar.category_slug
                         / sanitize_path_name(exemplar.time_of_day, "Any")
                         / sanitize_path_name(exemplar.mood_label, "Mood")
-                        / sanitize_path_name(
-                            f"{exemplar.type_label}__{exemplar.group_label}",
-                            f"Group_{exemplar.sound_kit_id}",
-                        )
+                        / sanitize_path_name(dir_name, f"Group_{exemplar.sound_kit_id}")
                     )
                     group_dir.mkdir(parents=True, exist_ok=True)
                     manifest_rows: list[dict[str, str | int | float]] = []
@@ -2866,7 +3120,9 @@ class App(tk.Tk):
                         title = str(override.get("title") or entry.default_title).strip() or entry.default_title
                         description = str(override.get("description") or entry.default_description).strip() or entry.default_description
                         tagged = bool(override.get("tagged", False))
-                        out_name = f"{index:03d}__fd{entry.file_data_id}__{sanitize_path_name(title, 'clip')}.{ext}"
+                        # Keep names short: these folders nest deep and Windows paths stop at 260 characters.
+                        short_title = sanitize_path_name(title[:MAX_TITLE_IN_FILENAME], "clip")
+                        out_name = f"{index:03d}__fd{entry.file_data_id}__{short_title}.{ext}"
                         out_file = group_dir / out_name
 
                         try:
@@ -2890,10 +3146,11 @@ class App(tk.Tk):
                                 *codec_args,
                                 str(out_file),
                             ]
-                            run = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False)
+                            run = run_hidden(ffmpeg_cmd)
                             if run.returncode != 0 or not out_file.exists() or out_file.stat().st_size < 256:
                                 stderr = (run.stderr or "").strip()
                                 raise RuntimeError(stderr or "ffmpeg conversion failed")
+                            remove_stale_copies(group_dir, entry.file_data_id, ext, keep=out_file)
 
                             relative_path = out_file.relative_to(zone_root).as_posix()
                             row = {
@@ -2944,10 +3201,7 @@ class App(tk.Tk):
 
                     if manifest_rows:
                         manifest = group_dir / "manifest.csv"
-                        with manifest.open("w", encoding="utf-8", newline="") as handle:
-                            writer = csv.DictWriter(handle, fieldnames=list(manifest_rows[0].keys()))
-                            writer.writeheader()
-                            writer.writerows(manifest_rows)
+                        write_manifest_csv(manifest, merge_manifest_rows(manifest, manifest_rows, zone_root))
 
                         zone_group_payloads.append(
                             {
@@ -2971,11 +3225,12 @@ class App(tk.Tk):
                         )
 
                 if zone_manifest_rows:
+                    # Earlier runs may have exported other clips of this zone. Keep them.
                     zone_manifest_csv = zone_root / "manifest.csv"
-                    with zone_manifest_csv.open("w", encoding="utf-8", newline="") as handle:
-                        writer = csv.DictWriter(handle, fieldnames=list(zone_manifest_rows[0].keys()))
-                        writer.writeheader()
-                        writer.writerows(zone_manifest_rows)
+                    zone_manifest_rows = merge_manifest_rows(zone_manifest_csv, zone_manifest_rows, zone_root)
+                    write_manifest_csv(zone_manifest_csv, zone_manifest_rows)
+                    zone_manifest_path = zone_root / ZONE_MANIFEST_FILENAME
+                    zone_group_payloads = merge_zone_groups(zone_manifest_path, zone_group_payloads, zone_root)
 
                     zone_manifest = {
                         "type": "wow_zone_audio_bundle",
@@ -2997,7 +3252,6 @@ class App(tk.Tk):
                         },
                         "groups": zone_group_payloads,
                     }
-                    zone_manifest_path = zone_root / ZONE_MANIFEST_FILENAME
                     zone_manifest_path.write_text(json.dumps(zone_manifest, indent=2), encoding="utf-8")
                     export_index["zones"].append(
                         {
@@ -3011,6 +3265,7 @@ class App(tk.Tk):
                     )
 
             if export_index["zones"]:
+                export_index["zones"] = merge_export_zones(output_dir / EXPORT_INDEX_FILENAME, export_index["zones"], output_dir)
                 export_index["zones"].sort(key=lambda row: (str(row["family_name"]).lower(), str(row["zone_name"]).lower()))
                 (output_dir / EXPORT_INDEX_FILENAME).write_text(json.dumps(export_index, indent=2), encoding="utf-8")
 
@@ -3059,7 +3314,7 @@ class App(tk.Tk):
             "version": APP_VERSION,
             "port": AGENT_PORT,
             "build": self.build_var.get(),
-            "version": APP_VERSION,
+            "loaded_build": self._loaded_build,
             "client": self.version_var.get(),
             "versions": [item.choice for item in self._installs],
             "wow_path": self.wow_path_var.get(),
@@ -3158,15 +3413,20 @@ class App(tk.Tk):
             box["result"] = self._agent_search_zones(body)
             return
         if path == "/zones/load":
+            if self._bridge_job is not None:
+                raise RuntimeError("Another agent request is still running.")
             if body.get("wow_path"):
                 self.wow_path_var.set(str(body["wow_path"]))
+                self._scan_installs(restore=False)
             if body.get("build"):
-                self.build_var.set(str(body["build"]))
-            if self.zones and not body.get("force"):
-                box["result"] = {"ok": True, "cached": True, "build": self.build_var.get(), "zones": len(self.zones)}
+                self.build_var.set(str(body["build"]).strip())
+            wanted_build = self.build_var.get().strip()
+            same_build = not wanted_build or wanted_build == self._loaded_build
+            if self.zones and same_build and not body.get("force"):
+                box["result"] = {"ok": True, "cached": True, "build": self._loaded_build, "zones": len(self.zones)}
                 return
             self._begin_bridge_job("load_zones", box, event)
-            if not self._run_worker(self._worker_load_zones, bool(body.get("force")), warn_if_busy=False):
+            if not self._start_load_zones(bool(body.get("force")), warn_if_busy=False):
                 self._bridge_job = None
                 box["pending"] = False
                 box["result"] = {"ok": False, "error": "A task is already running."}
@@ -3232,7 +3492,12 @@ class App(tk.Tk):
         if path == "/extract":
             which = str(body.get("which") or "checked")
             if body.get("format"):
-                self.format_var.set(str(body["format"]))
+                try:
+                    fmt, _args = ffmpeg_args_for_format(str(body["format"]))
+                except ValueError as exc:
+                    box["result"] = {"ok": False, "error": str(exc)}
+                    return
+                self.format_var.set(fmt)
             if body.get("output"):
                 self.output_path_var.set(str(body["output"]))
             wanted_ids = {_to_int(value) for value in body.get("file_data_ids") or []}
@@ -3248,13 +3513,11 @@ class App(tk.Tk):
                 box["result"] = {"ok": False, "error": f"There are no {which} clips to extract."}
                 return
             self._begin_bridge_job("extract", box, event)
-            before = self.worker_thread
-            self._start_extract_entries(entries, f"agent {which} clips")
-            started = self.worker_thread is not before and self.worker_thread is not None and self.worker_thread.is_alive()
-            if not started and self._bridge_job:
+            problem = self._start_extract_entries(entries, f"agent {which} clips", interactive=False)
+            if problem:
                 self._bridge_job = None
                 box["pending"] = False
-                box["result"] = {"ok": False, "error": "Extraction did not start."}
+                box["result"] = {"ok": False, "error": problem}
             return
         if path == "/preview":
             file_data_id = _to_int(body.get("file_data_id"))
@@ -3300,7 +3563,10 @@ class App(tk.Tk):
                         messagebox.showerror(APP_TITLE, item[1])
                 elif kind == "zones_loaded":
                     zones, build = item[1], item[2]
-                    if build == self.build_var.get().strip():
+                    current = self.build_var.get().strip()
+                    if not current or build == current:
+                        if build != self._loaded_build:
+                            self._clear_zone_selection()  # Clips from another build no longer apply.
                         self.zones = zones
                         self._loaded_build = build
                         self.build_var.set(build)
@@ -3310,20 +3576,26 @@ class App(tk.Tk):
                 elif kind == "index_ready":
                     build = item[1]
                     payload = self._index_payloads.get(build)
-                    if payload and build == self.build_var.get().strip() and self.resolver.install_audio_index(payload):
-                        self._log_ui(f"Restored sound indexes for build {build}.")
-                        self._set_status(f"Ready — {pretty_count(len(self.zones))} zones remembered.")
-                        self.progress_var.set(100.0)
+                    if payload and build == self.build_var.get().strip():
+                        installed = self.resolver.install_audio_index(payload, blocking=False)
+                        if installed is None:
+                            # A worker is indexing. Try again shortly instead of freezing the window.
+                            self.after(500, lambda b=build: self.ui_queue.put(("index_ready", b)))
+                        elif installed:
+                            self._log_ui(f"Restored sound indexes for build {build}.")
+                            self._set_status(f"Ready — {pretty_count(len(self.zones))} zones remembered.")
+                            self.progress_var.set(100.0)
                 elif kind == "zones_cached":
                     self._finish_bridge_job({"ok": True, "cached": True, "build": item[1], "zones": len(self.zones)})
                 elif kind == "assets_ready":
-                    zone_token, entries, resolved_defaults = item[1], item[2], item[3]
+                    zone_token, entries, resolved_defaults, playback = item[1], item[2], item[3], item[4]
                     if zone_token != self._current_zone_token():
                         self._finish_bridge_job({"ok": False, "error": "Zone selection changed before retrieval finished."})
                         self._schedule_asset_refresh()
                         continue
                     self.asset_entries = entries
                     self.asset_entry_map = {self._entry_key(entry): entry for entry in entries}
+                    self.entry_playback = playback
                     self._apply_resolved_defaults(entries, resolved_defaults)
                     self._update_filter_values()
                     self._refresh_recipe_label()
@@ -3348,7 +3620,15 @@ class App(tk.Tk):
                             event.set()
         except queue.Empty:
             pass
-        self.after(120, self._poll_queue)
+        except Exception as exc:  # noqa: BLE001 - one bad message must not stop the loop
+            self._log_ui(f"Internal error: {exc}")
+            self._log_ui(traceback.format_exc())
+            self._finish_bridge_job({"ok": False, "error": f"Internal error: {exc}"})
+        finally:
+            if self._pending_asset_refresh and not (self.worker_thread and self.worker_thread.is_alive()):
+                self._pending_asset_refresh = False
+                self._schedule_asset_refresh()
+            self.after(120, self._poll_queue)
 
 
 def main() -> None:

@@ -38,7 +38,7 @@ What it does:
   - Preview individual clips with ▶ Play / ■ Stop controls
   - Check/uncheck clips for extraction (☑ column)
   - Extract checked / tagged / all visible clips
-  - Choose output format: mp3 / wav / m4a
+  - Choose output format: mp3 / ogg / flac / wav / m4a
 - Friendly name resolution:
   - WoW expansion numbers translated: 120 → BFA, 110 → Legion, 140 → DF, etc.
   - CamelCase splitting: AtalAbasi → Atal Abasi
@@ -51,6 +51,9 @@ What it does:
   - <target>\wow_zone_audio_export.json
   - <target>\zones\<Family Name>\<Zone Name>\zone_manifest.json
   - manifest.csv files for each group and zone
+- When two sound kits share a group name, each folder gets a " (kit N)" suffix
+- Extracting again adds to the manifests and export index. Clips exported
+  before are kept, and a clip exported again replaces its older file.
 
 Notes:
 - Needs internet access (reads DB2 metadata + pulls audio by FileDataID)

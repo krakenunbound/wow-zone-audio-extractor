@@ -17,16 +17,19 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-HOST = "http://127.0.0.1:47221"
+HOST_ADDR = "127.0.0.1"
+PORT = 47221
+HOST = f"http://{HOST_ADDR}:{PORT}"
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "wow_zone_audio_extractor_gui.py")
-SERVER_INFO = {"name": "wow-ambient", "version": "0.4.0"}
+SERVER_INFO = {"name": "wow-ambient", "version": "0.4.4"}
 INSTRUCTIONS = (
     "WoW Zone Audio Extractor is a desktop app. These tools drive the open window. "
     "A zone ambience is separate clocks: Bed (one seamless loop, birds live inside it), "
@@ -111,7 +114,7 @@ TOOLS = [
     },
     {
         "name": "wow_extract",
-        "description": "Extract clips to the output folder. which is checked, visible, or tagged. Optional file_data_ids extracts just those.",
+        "description": "Extract clips to the output folder. which is checked, visible, or tagged. Optional file_data_ids extracts just those. format is mp3, ogg, flac, wav, or m4a.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -164,17 +167,32 @@ def http_json(method: str, path: str, body: dict | None = None, timeout: int = 3
         return json.loads(response.read().decode("utf-8") or "{}")
 
 
-def bridge_up() -> bool:
+def port_open() -> bool:
+    """True when something is listening on the bridge port, even if it is too busy to answer."""
     try:
-        http_json("GET", "/status", timeout=3)
-        return True
-    except (urllib.error.URLError, OSError, TimeoutError):
+        with socket.create_connection((HOST_ADDR, PORT), timeout=1.5):
+            return True
+    except OSError:
         return False
 
 
+def app_status(timeout: int = 10) -> dict:
+    """Ask the open window for its status. A slow answer means busy, not closed."""
+    try:
+        return http_json("GET", "/status", timeout=timeout)
+    except (TimeoutError, socket.timeout):
+        return {"ok": True, "busy": True, "note": "The window is open but did not answer in time. It may be busy or showing a dialog."}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {"ok": True, "busy": True, "note": "The window is open but did not answer in time. It may be busy or showing a dialog."}
+        raise
+
+
 def ensure_app() -> dict:
-    if bridge_up():
-        return http_json("GET", "/status", timeout=10)
+    # Launch only when nothing holds the port. A busy window still holds it, and a
+    # second copy would fail to bind and leave two windows open.
+    if port_open():
+        return app_status()
     exe = sys.executable
     pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
     if os.name == "nt" and os.path.exists(pythonw):
@@ -185,8 +203,8 @@ def ensure_app() -> dict:
     subprocess.Popen([exe, APP], cwd=HERE, creationflags=flags)
     deadline = time.time() + 25
     while time.time() < deadline:
-        if bridge_up():
-            return http_json("GET", "/status", timeout=10)
+        if port_open():
+            return app_status()
         time.sleep(0.4)
     return {"ok": False, "error": "The extractor window did not open. Start wow_zone_audio_extractor_gui.py."}
 
@@ -194,12 +212,9 @@ def ensure_app() -> dict:
 def call_tool(name: str, arguments: dict) -> dict:
     if name not in _PATHS:
         raise ValueError(f"unknown tool {name}")
-    if name != "wow_status":
-        status = ensure_app()
-        if status.get("ok") is False and not bridge_up():
-            return status
-    elif not bridge_up():
-        return ensure_app()
+    status = ensure_app()
+    if status.get("ok") is False or name == "wow_status":
+        return status
     method, path = _PATHS[name]
     timeout = 620 if name == "wow_extract" else 320 if name in {"wow_load_zones", "wow_open_zone"} else 30
     try:
