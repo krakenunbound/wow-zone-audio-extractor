@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+
+# Local checks and one-off scripts
+_check_*.py
+_gui_test/
+
+# Downloaded and extracted audio. Never commit game sounds.
+_raw_cache/
+zones/
+AtalAbasi/
+*.ogg
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.bin
+wow_zone_audio_export.json
+**/manifest.csv
+**/zone_manifest.json
+**/concat_list.txt
