@@ -2141,8 +2141,10 @@ class App(tk.Tk):
         # Action bar
         asset_actions = ttk.Frame(center, style="Card.TFrame")
         asset_actions.pack(fill=tk.X)
-        ttk.Button(asset_actions, text="☑ Check Visible", command=self._check_visible_entries).pack(side=tk.LEFT)
-        ttk.Button(asset_actions, text="☐ Uncheck Visible", command=self._uncheck_visible_entries).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(asset_actions, text="☑ Check All", command=self._check_all_entries).pack(side=tk.LEFT)
+        ttk.Button(asset_actions, text="☐ Uncheck All", command=self._uncheck_all_entries).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(asset_actions, text="Check Visible", command=self._check_visible_entries).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(asset_actions, text="Uncheck Visible", command=self._uncheck_visible_entries).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Separator(asset_actions, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=2)
         ttk.Button(asset_actions, text="⟡ Extract Checked", style="Accent.TButton", command=self._extract_checked_entries).pack(side=tk.LEFT)
         ttk.Button(asset_actions, text="Extract All", command=self._extract_visible_entries).pack(side=tk.LEFT, padx=(6, 0))
@@ -2718,7 +2720,7 @@ class App(tk.Tk):
                 override["description"] = resolved.get("description", entry.default_description)
             if resolved.get("lookup_path"):
                 override["lookup_path"] = resolved["lookup_path"]
-            override.setdefault("checked", not entry.is_weather)  # Weather is opt-in.
+            override.setdefault("checked", False)  # Nothing is marked until you check it.
 
     def _entry_override(self, entry: AudioEntry) -> dict[str, object]:
         key = self._entry_key(entry)
@@ -2740,7 +2742,7 @@ class App(tk.Tk):
         return bool(self._entry_override(entry).get("tagged", False))
 
     def _entry_checked(self, entry: AudioEntry) -> bool:
-        return bool(self._entry_override(entry).get("checked", not entry.is_weather))
+        return bool(self._entry_override(entry).get("checked", False))
 
     def _entry_playback(self, entry: AudioEntry) -> dict[str, object]:
         # Worked out on the retrieval thread. The UI thread never builds tables.
@@ -3157,6 +3159,24 @@ class App(tk.Tk):
 
     def _checked_entries(self) -> list[AudioEntry]:
         return [entry for entry in self.asset_entries if self._entry_checked(entry)]
+
+    def _check_all_entries(self) -> None:
+        self._set_all_checked(True)
+
+    def _uncheck_all_entries(self) -> None:
+        self._set_all_checked(False)
+
+    def _set_all_checked(self, checked: bool) -> None:
+        # Every clip of the open zones, including ones a filter hides.
+        entries = list(self.asset_entries)
+        if not entries:
+            messagebox.showinfo(APP_TITLE, "Retrieve a zone's audio first.")
+            return
+        self._set_checked_for_entries(entries, checked)
+        self._render_asset_tree()
+        verb = "Marked" if checked else "Removed"
+        where = "for" if checked else "from"
+        self.selection_summary_var.set(f"{verb} all {pretty_count(len(entries))} clip(s) {where} extraction.")
 
     def _check_visible_entries(self) -> None:
         entries = self._filtered_asset_entries()

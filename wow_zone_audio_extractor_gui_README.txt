@@ -36,7 +36,9 @@ What it does:
   - Tag specific clips with ★ indicators
   - Edit clip titles and descriptions
   - Preview individual clips with ▶ Play / ■ Stop controls
-  - Check/uncheck clips for extraction (☑ column)
+  - Check/uncheck clips for extraction (☑ column). Every clip starts
+    unchecked; Check All / Uncheck All cover every clip, Check Visible /
+    Uncheck Visible only the ones the filters show
   - Extract checked / tagged / all visible clips
   - Choose output format: mp3 / ogg / flac / wav / m4a
 - Friendly name resolution:
@@ -54,7 +56,7 @@ What it does:
 - When two sound kits share a group name, each folder gets a " (kit N)" suffix
 - Weather: with the Weather box ticked, each zone also lists weather presets
   (rain, snow, sandstorm, thunderstorm and more) under the Weather role.
-  They start unchecked; check the ones you want to export. WoW's data does
+  Like every clip they start unchecked. WoW's data does
   not say which weather a zone gets, because the server picks it.
 - zone_manifest.json gives each group its playback (role, time of day,
   weather) and import_defaults with pitch range, pan spread, first delay and

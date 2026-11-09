@@ -70,7 +70,7 @@ TOOLS = [
     },
     {
         "name": "wow_open_zone",
-        "description": "Select one zone in the window and retrieve its music, ambience and weather clips. Weather clips start unchecked; check the presets you want.",
+        "description": "Select one zone in the window and retrieve its music, ambience and weather clips. Every clip starts unchecked; check the ones you want (wow_check) before extracting checked clips.",
         "inputSchema": {
             "type": "object",
             "properties": {
